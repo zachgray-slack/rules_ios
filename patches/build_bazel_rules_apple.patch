@@ -1,0 +1,418 @@
+diff --git apple/internal/apple_framework_import.bzl apple/internal/apple_framework_import.bzl
+index 4f0f1a4..088b16b 100644
+--- apple/internal/apple_framework_import.bzl
++++ apple/internal/apple_framework_import.bzl
+@@ -56,6 +56,10 @@ load(
+     "SwiftUsageInfo",
+     "swift_common",
+ )
++load(
++    "@build_bazel_rules_apple//apple:providers.bzl",
++    "XCFrameworkInfo",
++)
+ 
+ def _is_swiftmodule(path):
+     """Predicate to identify Swift modules/interfaces."""
+@@ -160,9 +164,13 @@ def _grouped_framework_files(framework_imports):
+ 
+     return framework_groups
+ 
+-def _objc_provider_with_dependencies(ctx, objc_provider_fields):
++def _objc_provider_with_dependencies(ctx, objc_provider_fields, xcframeworkinfo = None):
+     """Returns a new Objc provider which includes transitive Objc dependencies."""
+     objc_provider_fields["providers"] = [dep[apple_common.Objc] for dep in ctx.attr.deps]
++    if xcframeworkinfo != None:
++        # todo: fix the lost `-framework` flag that's happening here due to use of depset
++        opts = ["-F%s" % xcframeworkinfo.framework_dirname, "-framework", xcframeworkinfo.framework_name]
++        objc_provider_fields["providers"].append(apple_common.new_objc_provider(linkopt = depset(opts, order = "topological") ))
+     return apple_common.new_objc_provider(**objc_provider_fields)
+ 
+ def _cc_info_with_dependencies(ctx, header_imports):
+@@ -253,7 +261,10 @@ def _apple_dynamic_framework_import_impl(ctx):
+     """Implementation for the apple_dynamic_framework_import rule."""
+     providers = []
+ 
+-    framework_imports = ctx.files.framework_imports
++    framework_imports, xcframeworkinfo = (_preprocess_xcframeworks(ctx))
++    if xcframeworkinfo != None:
++        providers.append(xcframeworkinfo)
++
+     bundling_imports, header_imports, module_map_imports = (
+         _classify_framework_imports(ctx.var, framework_imports)
+     )
+@@ -278,7 +289,7 @@ def _apple_dynamic_framework_import_impl(ctx):
+         [] if ctx.attr.bundle_only else _all_framework_binaries(framework_groups),
+     )
+ 
+-    objc_provider = _objc_provider_with_dependencies(ctx, objc_provider_fields)
++    objc_provider = _objc_provider_with_dependencies(ctx, objc_provider_fields, xcframeworkinfo)
+     cc_info = _cc_info_with_dependencies(ctx, header_imports)
+     providers.append(objc_provider)
+     providers.append(cc_info)
+@@ -287,14 +298,15 @@ def _apple_dynamic_framework_import_impl(ctx):
+         framework_dirs = framework_dirs_set,
+         framework_files = depset(framework_imports),
+     ))
+-
+     return providers
+ 
+ def _apple_static_framework_import_impl(ctx):
+     """Implementation for the apple_static_framework_import rule."""
+     providers = []
+ 
+-    framework_imports = ctx.files.framework_imports
++    framework_imports, xcframeworkinfo = (_preprocess_xcframeworks(ctx))
++    if xcframeworkinfo != None:
++        providers.append(xcframeworkinfo)
+     _, header_imports, module_map_imports = _classify_framework_imports(ctx.var, framework_imports)
+ 
+     transitive_sets = _transitive_framework_imports(ctx.attr.deps)
+@@ -337,7 +349,7 @@ def _apple_static_framework_import_impl(ctx):
+             if swiftmodule:
+                 objc_provider_fields.update(_ensure_swiftmodule_is_embedded(swiftmodule))
+ 
+-    providers.append(_objc_provider_with_dependencies(ctx, objc_provider_fields))
++    providers.append(_objc_provider_with_dependencies(ctx, objc_provider_fields, xcframeworkinfo))
+     providers.append(_cc_info_with_dependencies(ctx, header_imports))
+ 
+     bundle_files = [x for x in framework_imports if ".bundle/" in x.short_path]
+@@ -356,19 +368,68 @@ def _apple_static_framework_import_impl(ctx):
+ 
+     return providers
+ 
+-apple_dynamic_framework_import = rule(
+-    implementation = _apple_dynamic_framework_import_impl,
+-    fragments = ["apple"],
+-    attrs = {
+-        "framework_imports": attr.label_list(
+-            allow_empty = False,
+-            allow_files = True,
+-            mandatory = True,
+-            doc = """
++def _preprocess_xcframeworks(ctx):
++    xcframework_plists = []
++    for f in ctx.files.framework_imports:
++        if f.path.endswith(".xcframework/Info.plist"):
++            xcframework_plists.append(f)
++        # todo: ensure the user didnt glob multiple frameworks in next to the xcframework?
++    if len(xcframework_plists) == 0:
++        return ctx.files.framework_imports, None
++    if len(xcframework_plists) > 1:
++        fail("expected only 1 xcframework")
++    xcframework_plist = xcframework_plists[0]
++    platform = ctx.fragments.apple.single_arch_platform
++    platform_string = str(platform.platform_type)
++    if platform_string == "macos":
++        platform_string = "macosx"
++    environment = "" if platform.is_device else "-simulator"
++    triple = "{arch}-apple-{platform}{environment}".format(
++        environment = environment,
++        platform = platform_string,
++        arch = ctx.fragments.apple.single_arch_cpu
++    )
++    dir_name = "%s_xcframework.framework" % ctx.attr.name
++    selected_framework = ctx.actions.declare_directory(dir_name)
++    ctx.actions.run(
++        executable = ctx.executable._xcframework_selector,
++        arguments = [triple, xcframework_plist.path, selected_framework.path],
++        inputs = ctx.files.framework_imports,
++        outputs = [selected_framework],
++        mnemonic = "PreprocessXCFramework",
++    )
++    framework_binary_basename = selected_framework.basename.replace("_xcframework.framework", "")
++    framework_root = selected_framework.path
++    framework_binary_path = paths.join(framework_root, framework_binary_basename)
++    return [selected_framework], XCFrameworkInfo(
++        framework = selected_framework,
++        framework_name = paths.split_extension(selected_framework.basename)[0],
++        framework_binary_path = framework_binary_path,
++        framework_dirname = selected_framework.dirname,
++    )
++
++_common_attrs = {
++    "_xcframework_selector": attr.label(
++        cfg = "host",
++        default = Label("@build_bazel_rules_apple//tools/xcframework_selector"),
++        executable = True,
++    ),
++    "framework_imports": attr.label_list(
++        providers = [XCFrameworkInfo],
++        allow_empty = False,
++        allow_files = True,
++        mandatory = True,
++        doc = """
+ The list of files under a .framework directory which are provided to Apple based targets that depend
+ on this target.
+ """,
+-        ),
++    ),
++}
++
++apple_dynamic_framework_import = rule(
++    implementation = _apple_dynamic_framework_import_impl,
++    fragments = ["apple"],
++    attrs = dicts.add(_common_attrs, {
+         "deps": attr.label_list(
+             doc = """
+ A list of targets that are dependencies of the target being built, which will be linked into that
+@@ -391,7 +452,7 @@ Avoid linking the dynamic framework, but still include it in the app. This is us
+ to manually dlopen the framework at runtime.
+ """,
+         ),
+-    },
++    }),
+     doc = """
+ This rule encapsulates an already-built dynamic framework. It is defined by a list of files in
+ exactly one .framework directory. apple_dynamic_framework_import targets need to be added to library
+@@ -402,7 +463,7 @@ targets through the `deps` attribute.
+ apple_static_framework_import = rule(
+     implementation = _apple_static_framework_import_impl,
+     fragments = ["apple"],
+-    attrs = dicts.add(swift_common.toolchain_attrs(), {
++    attrs = dicts.add(_common_attrs, swift_common.toolchain_attrs(), {
+         "framework_imports": attr.label_list(
+             allow_empty = False,
+             allow_files = True,
+diff --git apple/internal/partials/framework_import.bzl apple/internal/partials/framework_import.bzl
+index c7bb9f8..f871fca 100644
+--- apple/internal/partials/framework_import.bzl
++++ apple/internal/partials/framework_import.bzl
+@@ -21,6 +21,7 @@ load(
+ load(
+     "@build_bazel_rules_apple//apple:providers.bzl",
+     "AppleFrameworkImportInfo",
++    "XCFrameworkInfo",
+ )
+ load(
+     "@build_bazel_rules_apple//apple/internal:bitcode_support.bzl",
+@@ -144,6 +145,35 @@ def _framework_import_partial_impl(
+         # Pass through all binaries, files, and relevant info as args.
+         args = actions.args()
+ 
++        # Since xcframeworks rely on generated folders and we won't have File handles to help us find the framework
++        # binary, we'll compute the framework binary path here.
++        # Known issue: user needs to provide a name attr which matches the binary name or the following logic
++        # will fail
++        if len(framework_binaries_by_framework[framework_basename]) == 0 and "xcframework" in framework_basename:
++            framework_binary_basename = framework_basename.replace("_xcframework.framework", "")
++            framework_root = files_by_framework[framework_basename][0].path
++            framework_binary_path = paths.join(framework_root, framework_binary_basename)
++            args.add("--framework_binary", framework_binary_path)
++            args.add_all(files_by_framework[framework_basename], before_each="--framework_file")
++        else:
++            for framework_binary in framework_binaries_by_framework[framework_basename]:
++                args.add("--framework_binary", framework_binary.path)
++            for file in files_by_framework[framework_basename]:
++                args.add("--framework_file", file.path)
++
++        # struggling to find the info provider here
++        # but ideally would use this, not the above.
++
++#        xcframework_binaries = [
++#            x[XCFrameworkInfo].framework_binary_path
++#            for x in targets
++#            if XCFrameworkInfo in x
++#        ]
++#        print(len(xcframework_binaries))
++#        for b in xcframework_binaries:
++#            print('added xcbinary')
++#            args.add("--framework_binary", b)
++
+         for framework_binary in framework_binaries_by_framework[framework_basename]:
+             args.add("--framework_binary", framework_binary.path)
+ 
+@@ -156,9 +186,9 @@ def _framework_import_partial_impl(
+         args.add("--output_zip", framework_zip.path)
+ 
+         args.add("--temp_path", temp_framework_bundle_path)
+-
+-        for file in files_by_framework[framework_basename]:
+-            args.add("--framework_file", file.path)
++#
++#        for file in files_by_framework[framework_basename]:
++#            args.add("--framework_file", file.path)
+ 
+         codesign_args = codesigning_support.codesigning_args(
+             entitlements = None,
+diff --git apple/providers.bzl apple/providers.bzl
+index 8834d32..2fdcf5d 100644
+--- apple/providers.bzl
++++ apple/providers.bzl
+@@ -657,3 +657,13 @@ a dependency is a watchOS static framework should use this provider to describe
+ that requirement.
+ """,
+ )
++
++XCFrameworkInfo = provider(
++    doc = "todo",
++    fields = {
++        "framework_name": "string",
++        "framework_binary_path": "string",
++        "framework_dirname": "string",
++        "framework": "file"
++    }
++)
+\ No newline at end of file
+diff --git tools/imported_dynamic_framework_processor/imported_dynamic_framework_processor.py tools/imported_dynamic_framework_processor/imported_dynamic_framework_processor.py
+index ce44809..a0e2975 100644
+--- tools/imported_dynamic_framework_processor/imported_dynamic_framework_processor.py
++++ tools/imported_dynamic_framework_processor/imported_dynamic_framework_processor.py
+@@ -71,8 +71,14 @@ def _copy_framework_file(framework_file, executable, output_path):
+   temp_framework_dirs = os.path.dirname(temp_framework_path)
+   if not os.path.exists(temp_framework_dirs):
+     os.makedirs(temp_framework_dirs)
+-  shutil.copy(framework_file, temp_framework_path)
+-  os.chmod(temp_framework_path, 0o755 if executable else 0o644)
++  if os.path.isdir(framework_file):
++    shutil.rmtree(temp_framework_path)
++    shutil.copytree(framework_file, temp_framework_path, dirs_exist_ok=True)
++  else:
++    if os.path.exists(temp_framework_path):
++        os.remove(temp_framework_path)
++    shutil.copy(framework_file, temp_framework_path)
++    os.chmod(temp_framework_path, 0o755 if executable else 0o644)
+   return 0
+ 
+ 
+diff --git tools/xcframework_selector/BUILD tools/xcframework_selector/BUILD
+new file mode 100644
+index 0000000..d0818a1
+--- /dev/null
++++ tools/xcframework_selector/BUILD
+@@ -0,0 +1,10 @@
++licenses(["notice"])
++
++py_binary(
++    name = "xcframework_selector",
++    srcs = ["xcframework_selector.py"],
++    srcs_version = "PY3",
++    visibility = [
++        "//visibility:public"
++    ],
++)
+\ No newline at end of file
+diff --git tools/xcframework_selector/xcframework_selector.py tools/xcframework_selector/xcframework_selector.py
+new file mode 100644
+index 0000000..254b048
+--- /dev/null
++++ tools/xcframework_selector/xcframework_selector.py
+@@ -0,0 +1,118 @@
++# Copyright 2021 The Bazel Authors. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++import errno
++from typing import Any, Dict, Set
++import re
++import os
++import plistlib
++import shutil
++import sys
++import pathlib
++
++# classes borrowed from https://github.com/keith/xcframework-to-fat/blob/main/xcframework-to-fat
++_VALID_PLATFORMS = {"watchos", "ios", "tvos", "macosx"}
++_VALID_ARCHS = {"i386", "arm64", "arm64e", "x86_64", "armv7s", "armv7k"}
++
++
++class Triple:
++    # Examples: x86_64-apple-ios11.0-simulator, arm64-apple-ios11.0
++    def __init__(self, triple: str):
++        self._original = triple
++        parts = triple.split("-")
++        if len(parts) not in (2, 3, 4):
++            raise SystemExit(
++                f"ERROR: invalid triple: '{triple}', expected arch-apple-platform[version][-simulator]"
++            )
++
++        self.arch = parts[0]
++        if self.arch not in _VALID_ARCHS:
++            raise SystemExit(
++                f"ERROR: unexpected arch: '{self.arch}', expected one of: {', '.join(_VALID_ARCHS)}"
++            )
++
++        self.platform = parts[1]
++        if self.platform == "apple":
++            self.platform = parts[2]
++
++        self.platform = re.sub(r"[^a-z]+", "", self.platform)
++        if self.platform not in _VALID_PLATFORMS:
++            raise SystemExit(
++                f"ERROR: unexpected platform: {self.platform}, expected one of: {', '.join(_VALID_PLATFORMS)}"
++            )
++
++        self.is_simulator = parts[-1] == "simulator"
++
++    def __str__(self) -> str:
++        return self._original
++
++
++class Library:
++    def __init__(self, root: str, plist_definition: Dict[str, Any]):
++        self.name = os.path.splitext(plist_definition["LibraryPath"])[0]
++        self.framework_path: str = os.path.join(
++            root,
++            plist_definition["LibraryIdentifier"],
++            plist_definition["LibraryPath"],
++        )
++        self.binary_path = os.path.join(self.framework_path, self.name)
++        self.archs: Set[str] = set(plist_definition["SupportedArchitectures"])
++        self.platform: str = plist_definition["SupportedPlatform"]
++        self.is_simulator = (
++                plist_definition.get("SupportedPlatformVariant") == "simulator"
++        )
++
++    def matches(self, triple: Triple) -> bool:
++        return (
++                triple.platform == self.platform
++                and triple.arch in self.archs
++                and triple.is_simulator == self.is_simulator
++        )
++
++
++def _main(triple_string, plist_path, output_path):
++    triple = Triple(triple_string)
++    with open(plist_path, "br") as plist_file:
++        xcframework_path = plist_path.split("/Info.plist")[0]
++        plist = plistlib.load(plist_file)
++        v = plist["XCFrameworkFormatVersion"]
++        if v != "1.0":
++            raise SystemExit(f"ERROR: unsupported xcframework version: {v}")
++        found = False
++        for definition in plist["AvailableLibraries"]:
++            library = Library(xcframework_path, definition)
++            if library.matches(triple):
++                if found:
++                    raise SystemExit(
++                        f"ERROR: multiple .framework matches found for triple: '{triple}'",
++                    )
++                shutil.copytree(
++                    library.framework_path,
++                    output_path,
++                    symlinks=False,
++                    ignore_dangling_symlinks=False,
++                    dirs_exist_ok=True
++                )
++                found = True
++        if not found:
++            raise SystemExit(
++                f"ERROR: .framework not found for triple: '{triple}'"
++            )
++
++
++if __name__ == '__main__':
++    if len(sys.argv) < 4:
++        sys.stderr.write('ERROR: expected exactly 3 arguments\n')
++        exit(1)
++    _main(sys.argv[1], sys.argv[2], sys.argv[3])
+\ No newline at end of file

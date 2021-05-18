@@ -17,7 +17,7 @@ def _maybe(repo_rule, name, **kwargs):
     if not native.existing_rule(name):
         repo_rule(name = name, **kwargs)
 
-def github_repo(name, project, repo, ref, sha256 = None):
+def github_repo(name, project, repo, ref, sha256 = None, patches = None):
     """Downloads a repository from GitHub as a tarball.
 
     Args:
@@ -26,6 +26,7 @@ def github_repo(name, project, repo, ref, sha256 = None):
         repo: The name of the repository on GitHub.
         ref: The reference to be downloaded. Can be any named ref, e.g. a commit, branch, or tag.
         sha256: The sha256 of the downloaded tarball.
+        patches: Patches to apply to fetched repository
     """
 
     github_url = "https://github.com/{project}/{repo}/archive/{ref}.zip".format(
@@ -39,6 +40,7 @@ def github_repo(name, project, repo, ref, sha256 = None):
         url = github_url,
         sha256 = sha256,
         canonical_id = github_url,
+        patches = patches,
     )
 
 def rules_ios_dependencies():
@@ -48,6 +50,7 @@ def rules_ios_dependencies():
         github_repo,
         name = "build_bazel_rules_apple",
         ref = "ed2bceef7ac5a3071b023e3122a045a133d2245c",
+        patches = ["//patches:build_bazel_rules_apple.patch"],
         project = "bazelbuild",
         repo = "rules_apple",
         sha256 = "3bbbc0ffa8aad392bc9a5032bccc366edb96723544dbdf89137d0223cf7350c1",
